@@ -44,16 +44,16 @@ fi
 
 if [[ "${DEPTH}" -gt 2 ]]; then
   echo "you probably don't want to do > 2 (default). [enter to continue]"
-  #read
+  read
 fi
 
 echo "Running with: [${MAX_RUNNING}]:Jobs [${DEPTH}]:Depth"
 
-#if [ ${UID} -ne 0 ]
-#then
-#        echo "Not running as root, we may not be able to read all binaries on the system [enter to continue]"
-#        read
-#fi
+if [ ${UID} -ne 0 ]
+then
+        echo "Not running as root, we may not be able to read all binaries on the system [enter to continue]"
+        read
+fi
 
 if [[ "${os}" == 'linux' || "${os}" == *"bsd"* ]]; then
   LDD=$(which ldd)
