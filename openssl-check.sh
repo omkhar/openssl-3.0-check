@@ -1,41 +1,77 @@
 #!/usr/bin/env bash
 # License GPL
 # Copyright 2022 Omkhar Arasaratnam
-#   - made sexier by rob dailey
 
-DEPTH=${1:-2}
+#set -x 
+
+function cleanup_kids { 
+  for job in $(jobs -lp); do
+     kill -9 ${job}
+  done
+  exit 1
+}
+trap cleanup_kids INT
+
+DEPTH=2
+MAX_RUNNING=0
 PREV=""
+LDD=""
+LDD_FLAGS=""
+FIND=""
 BASE_EXCLUDES=""
 declare -A BASE_EXCLUDES
 
-PID=$$
-echo "PID: ${PID}"
+os=$(uname | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
 
-MAX_RUNNING=$(cat /proc/cpuinfo0 2>/dev/null | grep -c processor)
-if [[ ${MAX_RUNNING} == 0 ]]; then
-  MAX_RUNNING=$(sysctl hw.ncpu 2>/dev/null | tr -cd '[:digit:]')
-  MAX_RUNNING=$((${MAX_RUNNING:-4} / 2))
-fi
-echo "Running with [${MAX_RUNNING}] Jobs"
+while getopts c:d: cmd_flag; do
+  case "${cmd_flag}" in
+    c) MAX_RUNNING=${OPTARG};;
+    d) DEPTH=${OPTARG};;
+  esac
+done
 
-if [ ${UID} -ne 0 ]
-then
-        echo "Not running as root, we may not be able to read all binaries on the system [enter to continue]"
-        read
+if [[ "${MAX_RUNNING}" == 0 ]]; then
+  MAX_RUNNING=$(cat /proc/cpuinfo 2>/dev/null | grep -c processor)
+
+  if [[ "${MAX_RUNNING}" == 0 ]]; then
+    MAX_RUNNING=$(sysctl hw.ncpu 2>/dev/null | tr -cd '[:digit:]')
+    MAX_RUNNING=$(( ${MAX_RUNNING:-"4"} / 8 ))
+    if [[ "${MAX_RUNNING}" -lt "4" ]]; then
+      MAX_RUNNING=4  # seems to be optimal min
+    fi
+  fi
 fi
 
-if [ ${DEPTH} -gt 2 ]; then
-    echo "Don't run more than 2 deep unless you know something special ... it gets slower (currently) [enter to continue]"
-    read
+if [[ "${DEPTH}" -gt 2 ]]; then
+  echo "you probably don't want to do > 2 (default). [enter to continue]"
+  #read
 fi
 
-LDD=`which ldd`
-EXIT=$?
-if [ ${EXIT} -ne 0 ]
-then
-        echo "Couldn't find ldd, exiting"
-        exit 1
+echo "Running with: [${MAX_RUNNING}]:Jobs [${DEPTH}]:Depth"
+
+#if [ ${UID} -ne 0 ]
+#then
+#        echo "Not running as root, we may not be able to read all binaries on the system [enter to continue]"
+#        read
+#fi
+
+if [[ "${os}" == 'linux' || "${os}" == *"bsd"* ]]; then
+  LDD=$(which ldd)
+  LIB="libssl.so.3"
+elif [[ "${os}" == 'darwin' ]]; then
+  LDD=$(which otool)
+  LDD_FLAGS="-L"
+  LIB="libssl.3.dylib"
+else
+  echo "unsupported OS [${os}]"
+  exit 1
 fi
+
+if [[ -z "${LDD}" ]]; then
+  echo "Couldn't find ldd, exiting"
+  exit 1
+fi
+
 
 FIND=`which find`
 EXIT=$?
@@ -48,13 +84,12 @@ fi
 
 function run_parallel {
 
-  SELF_RUNNING=$(jobs | wc -l | tr -cd '[:digit:]')
-  if [[ $SELF_RUNNING -ge ${MAX_RUNNING} ]]; then
-    wait -n
-  fi
-
-  ${FIND} ${1} ${@:2} -type f -perm -a=x -print0 2>/dev/null |
-      xargs -0 -I FILE_NAME sh -c "(${LDD} \"FILE_NAME\" 2>/dev/null | grep -q libssl.so.3 2>/dev/null) && echo \"FILE_NAME may be dynamically linked to openssl-3.x\"" &
+  while read -r file_path; do
+    ldd_out=$(${LDD} ${LDD_FLAGS} ${file_path} 2>/dev/null)
+    if [[ ${ldd_out} == *"${LIB}"* ]]; then
+      echo "'${file_path}' may be dynamically linked to openssl-3.x"
+    fi
+  done < <(${FIND} "${1}" ${@:2} -type f -perm -a=x -print 2>/dev/null)
 
 }
 
@@ -68,26 +103,33 @@ while read -r dir_path; do
   IFS='\/' read -ra split_path <<< "${dir_path}"
   unset split_path[0] # clean null
   _BASE="${split_path[@]:0:${DEPTH}+1}" # we index at 0
-  _BASE=$(sed -e 's/^[[:space:]]*//'<<<"${_BASE}")
+  _BASE="${_BASE#"${_BASE}%%[![:space:]]*}"}" 
 
   if [[ "${PREV}" == "${dir_path}" ]];  then
-      run_parallel ${dir_path} -maxdepth 1 ! -type d ${BASE_EXCLUDES[${_BASE}]}
+    (run_parallel ${dir_path} -maxdepth 1 \( ${BASE_EXCLUDES[${_BASE}]} \) -prune -o ! -type d) &
+    unset ${BASE_EXCLUDES[${_BASE}]}  # cleanup memory
   else
-      # not a top level path
-      run_parallel ${dir_path}
+    # not a top level path
+    (run_parallel ${dir_path}) &
 
   fi
-  BASE_EXCLUDES[${_BASE}]="${BASE_EXCLUDES[${_BASE}]} -name \"${dir_path}\" -prune -o"
+  BASE_EXCLUDES[${_BASE}]="${BASE_EXCLUDES[${_BASE}]} -path \"${dir_path}\" -o"
   PREV=$(dirname ${dir_path})
 
   _skip_tree=""
   for _skip_base in "${split_path[@]}"; do
       _skip_tree="${_skip_tree} ${_skip_base}"
-      _skip_tree=$(sed -e 's/^[[:space:]]*//'<<<"${_skip_tree}")
+      _skip_tree="${_skip_tree#"${_skip_tree}%%[![:space:]]*}"}" 
       BASE_EXCLUDES[${_skip_tree}]="${BASE_EXCLUDES[${_skip_tree}]} ${BASE_EXCLUDES[${_BASE}]}"
   done
 
-done < <(find / -maxdepth ${DEPTH} -type d -name "/proc" -prune -o -print 2>/dev/null | sort -r)
+  SELF_RUNNING=$(jobs | grep -c ' Running ')
+  while [[ "$SELF_RUNNING" -ge "${MAX_RUNNING}" ]]; do
+    SELF_RUNNING=$(jobs | grep -c ' Running ')
+    wait -n
+  done
+
+done < <(find / -fstype local -maxdepth ${DEPTH} \( -path "/proc" -o -path "/System/Volumes/Data" \) -prune -o -type d -print 2>/dev/null | sort -r)
 
 # catch any leftover files
 while read -r dir_path; do
